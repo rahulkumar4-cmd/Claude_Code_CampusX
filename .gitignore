@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# SQLite database
+*.db
+*.sqlite3
+
+# uv
+.python-version
+
+# macOS
+.DS_Store
+
+# IDE
+.cursor/
+.vscode/
+.idea/
+
+# pytest
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Flask
+instance/
