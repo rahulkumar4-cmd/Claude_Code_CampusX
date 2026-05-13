@@ -1,0 +1,381 @@
+#!/bin/bash
+
+# Custom git sync command with interactive permissions
+# Usage: /git-sync from Claude Code
+
+set -e  # Exit on error
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Helper function: print colored messages
+print_info() {
+    echo -e "${BLUE}ℹ ${1}${NC}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓ ${1}${NC}"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠ ${1}${NC}"
+}
+
+print_error() {
+    echo -e "${RED}✗ ${1}${NC}"
+}
+
+# Helper function: confirm action (y/n)
+confirm_action() {
+    local prompt="$1"
+    local response
+    while true; do
+        read -p "$(echo -e ${BLUE}${prompt}${NC}) (y/n): " response
+        case "$response" in
+            [Yy]* ) return 0;;
+            [Nn]* ) return 1;;
+            * ) echo "Please answer y or n.";;
+        esac
+    done
+}
+
+# Phase 1: Pre-flight checks
+check_git_repo() {
+    if [ ! -d .git ]; then
+        print_error "Not a git repository. Run this command from the project root."
+        exit 1
+    fi
+}
+
+check_detached_head() {
+    if ! git symbolic-ref -q HEAD > /dev/null; then
+        print_error "Cannot sync from detached HEAD. Checkout a branch first:"
+        echo "  git checkout main"
+        exit 1
+    fi
+}
+
+fetch_remote() {
+    print_info "Fetching from remote..."
+    if ! git fetch origin 2>&1; then
+        print_warning "Fetch failed. Retrying in 3 seconds..."
+        sleep 3
+        if ! git fetch origin 2>&1; then
+            print_error "Failed to fetch from remote. Check your network connection."
+            exit 1
+        fi
+    fi
+    print_success "Remote refs updated"
+}
+
+# Get current branch name
+get_current_branch() {
+    git rev-parse --abbrev-ref HEAD
+}
+
+# Compare local vs remote (ahead/behind/diverged)
+compare_branches() {
+    local branch="$1"
+    local upstream="origin/$branch"
+
+    # Check if remote branch exists
+    if ! git rev-parse --verify "$upstream" >/dev/null 2>&1; then
+        echo "no-upstream"
+        return
+    fi
+
+    local ahead=$(git rev-list --count "$upstream".."$branch")
+    local behind=$(git rev-list --count "$branch".."$upstream")
+
+    if [ "$ahead" -gt 0 ] && [ "$behind" -gt 0 ]; then
+        echo "diverged|$ahead|$behind"
+    elif [ "$behind" -gt 0 ]; then
+        echo "behind|$behind"
+    elif [ "$ahead" -gt 0 ]; then
+        echo "ahead|$ahead"
+    else
+        echo "up-to-date"
+    fi
+}
+
+# Phase 2: Status review
+show_status() {
+    local branch=$(get_current_branch)
+    local status=$(git status --porcelain)
+    local status_output=$(compare_branches "$branch")
+
+    echo ""
+    echo "═══════════════════════════════════════════"
+    print_info "Current branch: $branch"
+    echo "═══════════════════════════════════════════"
+
+    # Show file status
+    if [ -n "$status" ]; then
+        local modified=$(echo "$status" | grep -c "^ M" || true)
+        local staged=$(echo "$status" | grep -c "^M" || true)
+        local untracked=$(echo "$status" | grep -c "^??" || true)
+
+        [ "$modified" -gt 0 ] && print_warning "Modified files: $modified"
+        [ "$staged" -gt 0 ] && print_info "Staged files: $staged"
+        [ "$untracked" -gt 0 ] && print_info "Untracked files: $untracked"
+    else
+        print_success "Working tree is clean"
+    fi
+
+    # Show branch relationship
+    IFS='|' read -ra STATUS_PARTS <<< "$status_output"
+    case "${STATUS_PARTS[0]}" in
+        "up-to-date")
+            print_success "Branch is up to date with origin/$branch"
+            ;;
+        "ahead")
+            print_info "Branch is ahead of origin/$branch by ${STATUS_PARTS[1]} commit(s)"
+            ;;
+        "behind")
+            print_warning "Branch is behind origin/$branch by ${STATUS_PARTS[1]} commit(s)"
+            ;;
+        "diverged")
+            print_warning "Branch has diverged from origin/$branch"
+            echo "  Local: ${STATUS_PARTS[1]} commit(s) ahead"
+            echo "  Remote: ${STATUS_PARTS[2]} commit(s) ahead"
+            ;;
+        "no-upstream")
+            print_warning "No upstream branch found for $branch"
+            ;;
+    esac
+    echo "═══════════════════════════════════════════"
+    echo ""
+
+    # Return status for next phase
+    echo "$status_output"
+}
+
+# Phase 3: Pull if needed
+pull_if_behind() {
+    local status_output="$1"
+    local branch=$(get_current_branch)
+
+    IFS='|' read -ra STATUS_PARTS <<< "$status_output"
+
+    case "${STATUS_PARTS[0]}" in
+        "behind")
+            if confirm_action "Pull ${STATUS_PARTS[1]} commit(s) from origin/$branch?"; then
+                print_info "Pulling changes..."
+                if git pull origin "$branch"; then
+                    print_success "Successfully pulled changes"
+                else
+                    if git diff --name-only --diff-filter=U | grep -q .; then
+                        print_error "Merge conflicts detected:"
+                        git diff --name-only --diff-filter=U
+                        echo ""
+                        print_error "Resolve conflicts manually, then run /git-sync again"
+                        exit 1
+                    else
+                        print_error "Pull failed"
+                        exit 1
+                    fi
+                fi
+            else
+                print_info "Skipping pull"
+            fi
+            ;;
+        "diverged")
+            print_error "Local and remote have diverged. Manual merge required."
+            echo ""
+            echo "Local commits:"
+            git log origin/"$branch".."$branch" --oneline
+            echo ""
+            echo "Remote commits:"
+            git log "$branch"..origin/"$branch" --oneline
+            echo ""
+            echo "Resolve manually with one of:"
+            echo "  git pull origin $branch              (merge)"
+            echo "  git pull --rebase origin $branch     (rebase)"
+            exit 1
+            ;;
+    esac
+}
+
+# Phase 4: Interactive staging
+interactive_staging() {
+    local status=$(git status --porcelain)
+
+    if [ -z "$status" ]; then
+        # Check if there are already staged changes
+        if ! git diff --cached --quiet; then
+            print_info "Files already staged for commit"
+            return 0
+        fi
+        print_warning "No changes to commit"
+        return 1
+    fi
+
+    echo ""
+    print_info "Modified and untracked files:"
+    echo "═══════════════════════════════════════════"
+
+    # Show files with numbers
+    local i=1
+    declare -a files
+    while IFS= read -r line; do
+        local status_code="${line:0:2}"
+        local file="${line:3}"
+        files[$i]="$file"
+        printf "%2d) [%s] %s\n" "$i" "$status_code" "$file"
+        ((i++))
+    done <<< "$status"
+
+    echo "═══════════════════════════════════════════"
+    echo ""
+
+    # Ask for file selection
+    echo "Enter file numbers to stage (space-separated, 'a' for all, or 'q' to quit):"
+    read -p "> " selection
+
+    if [ "$selection" = "q" ]; then
+        print_info "Staging cancelled"
+        return 1
+    fi
+
+    if [ "$selection" = "a" ]; then
+        if confirm_action "Stage all files?"; then
+            git add -A
+            print_success "All files staged"
+            return 0
+        else
+            return 1
+        fi
+    fi
+
+    # Stage selected files
+    local staged_count=0
+    for num in $selection; do
+        if [ "$num" -ge 1 ] && [ "$num" -lt "$i" ]; then
+            git add "${files[$num]}"
+            print_success "Staged: ${files[$num]}"
+            ((staged_count++))
+        else
+            print_warning "Invalid selection: $num"
+        fi
+    done
+
+    if [ "$staged_count" -eq 0 ]; then
+        print_warning "No files staged"
+        return 1
+    fi
+
+    return 0
+}
+
+# Phase 5: Commit
+commit_changes() {
+    # Show staged files
+    echo ""
+    print_info "Staged files:"
+    git diff --cached --name-status
+    echo ""
+
+    # Prompt for commit message
+    local message
+    while true; do
+        read -p "$(echo -e ${BLUE}Enter commit message:${NC}) " message
+        if [ -n "$message" ]; then
+            break
+        fi
+        print_warning "Commit message cannot be empty"
+    done
+
+    echo ""
+    if confirm_action "Commit with message: '$message'?"; then
+        if git commit -m "$message"; then
+            print_success "Changes committed"
+            return 0
+        else
+            print_error "Commit failed"
+            return 1
+        fi
+    else
+        print_info "Commit cancelled"
+        return 1
+    fi
+}
+
+# Phase 6: Push
+push_changes() {
+    local branch=$(get_current_branch)
+
+    # Check if there are commits to push
+    local commits_ahead=$(git rev-list --count origin/"$branch".."$branch" 2>/dev/null || echo "0")
+
+    if [ "$commits_ahead" -eq 0 ]; then
+        print_info "No commits to push"
+        return 0
+    fi
+
+    echo ""
+    print_info "Commits to push ($commits_ahead):"
+    git log origin/"$branch"..HEAD --oneline
+    echo ""
+
+    if confirm_action "Push $commits_ahead commit(s) to origin/$branch?"; then
+        print_info "Pushing to remote..."
+        if git push origin "$branch"; then
+            print_success "Successfully pushed to origin/$branch"
+            return 0
+        else
+            print_error "Push rejected (non-fast-forward)"
+            print_warning "Remote has new commits. Run /git-sync again to pull first."
+            return 1
+        fi
+    else
+        print_info "Push cancelled"
+        return 1
+    fi
+}
+
+# Main execution
+main() {
+    echo ""
+    print_info "Git Sync - Interactive Workflow"
+    echo ""
+
+    # Phase 1: Pre-flight checks
+    check_git_repo
+    check_detached_head
+    fetch_remote
+
+    # Phase 2: Status review
+    local status_output=$(show_status)
+    if ! confirm_action "Continue with sync?"; then
+        print_info "Sync cancelled"
+        exit 0
+    fi
+
+    # Phase 3: Pull if behind
+    pull_if_behind "$status_output"
+
+    # Phase 4: Interactive staging
+    if ! interactive_staging; then
+        print_info "No changes to commit. Checking for commits to push..."
+        push_changes
+        exit 0
+    fi
+
+    # Phase 5: Commit
+    if ! commit_changes; then
+        exit 0
+    fi
+
+    # Phase 6: Push
+    push_changes
+
+    echo ""
+    print_success "Git sync complete!"
+}
+
+# Run main
+main
